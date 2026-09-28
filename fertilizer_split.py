@@ -1,4 +1,4 @@
-"""肥料母液 A/B 分罐求解核心：连通分量二着色 + 全局翻转组合枚举。
+"""肥料母液 A/B 分罐求解核心：连通分量二着色 + 奇偶状态 BFS 奇环 + 全局翻转组合枚举。
 
 问题模型
 --------
@@ -9,8 +9,9 @@
 求解步骤
 --------
 1. 只用「用量 > 0」的肥料构建不相容图，按边拆分**连通分量**并做 BFS 二着色。
-2. 出现**奇环**时图不可二着色 -> 返回长度最短的冲突环（闭环节点序列），
-   不再给分罐结果。
+2. 出现**奇环**时图不可二着色 -> 在每个非二分分量上以**奇偶状态 BFS**
+   （状态为「节点 + 走到该节点路径的奇偶性」）求该分量的最短奇环，
+   全图各分量取最短者（同长按规范化肥料 ID 序列决胜），不再给分罐结果。
 3. 每个连通分量着色为两侧（side0 / side1），翻转方向决定哪一侧进 A 罐；
    枚举所有分量的 2^k 种全局翻转组合（分量数 > 20 时组合过多直接报错）。
 4. 目标：先要求双罐均不超容量；可行组合中以 **|A 体积 − B 体积| 最小**为目标，
@@ -107,8 +108,8 @@ def _build_graph(active, pair_ids):
 def _split_components(adj):
     """BFS 拆分连通分量并二着色。
 
-    返回 [(member_ids, color, conflict_edges)]：
-    member_ids 按发现顺序；color 为 {id: 0/1}（奇环时着色仍返回，冲突边两端同色）。
+    返回 [(member_ids, color, is_conflict)]：
+    member_ids 按发现顺序；color 为 {id: 0/1}（奇环时着色仍返回，is_conflict=True）。
     """
     seen = set()
     components = []
@@ -119,7 +120,7 @@ def _split_components(adj):
         order = []
         q = deque([root])
         seen.add(root)
-        conflict_edges = []
+        is_conflict = False
         while q:
             u = q.popleft()
             order.append(u)
@@ -129,35 +130,68 @@ def _split_components(adj):
                     color[v] = color[u] ^ 1
                     q.append(v)
                 elif color[v] == color[u]:
-                    conflict_edges.append((u, v))
-        components.append((order, color, conflict_edges))
+                    is_conflict = True
+        components.append((order, color, is_conflict))
     components.sort(key=lambda c: c[0][0])
     return components
 
 
-def _shortest_path(adj, src, dst, banned_edge):
-    """无向图 BFS 求 src→dst 最短路径（排除 banned_edge 这条边），返回节点列表或 None。"""
-    q = deque([src])
-    prev = {src: None}
+def _parity_bfs_dist(adj, src):
+    """奇偶状态 BFS：返回 dist[(node, parity)] = src 出发以该奇偶长度到达 node
+    的最短**步数**（按边计）。状态 (u, p) 经边 (u, v) 转到 (v, p ^ 1)。
+    """
+    dist = {(src, 0): 0}
+    q = deque([(src, 0)])
     while q:
-        u = q.popleft()
-        if u == dst:
-            break
+        u, p = q.popleft()
+        nd = dist[(u, p)] + 1
         for v in sorted(adj[u]):
-            # 精确排除被环借用的那条边（无向、端点顺序无关）
-            if (u, v) == banned_edge or (v, u) == banned_edge:
-                continue
-            if v not in prev:
-                prev[v] = u
-                q.append(v)
-    if dst not in prev:
-        return None
-    path = []
-    cur = dst
-    while cur is not None:
-        path.append(cur)
-        cur = prev[cur]
-    return path[::-1]
+            state = (v, p ^ 1)
+            if state not in dist:
+                dist[state] = nd
+                q.append(state)
+    return dist
+
+
+def _lex_min_parity_walk(adj, start_state, end_state, forward, backward):
+    """在所有 start_state → end_state 的最短（步数 = forward[end_state]）状态
+    路径中，按节点 ID 序列字典序取最小者，并返回对应的**节点序列**（不含终点状态）。
+
+    forward/backward 分别为起点正向、终点反向（无向图中状态翻转）奇偶 BFS 距离。
+    每一步在「剩余步数恰好用完可达终点」的邻点中选编号最小者，保证字典序最小且
+    一定落在某条最短路径上。
+    """
+    total = forward[end_state]
+    cur = start_state
+    walk_nodes = [cur[0]]
+    for step in range(total):
+        u, p = cur
+        remain = total - step - 1
+        candidates = []
+        for v in adj[u]:
+            nxt = (v, p ^ 1)
+            # 正向尚未偏离最短路径（由逐步选择保证），且该下一步能在剩余步数内到终点
+            if backward.get(nxt) == remain:
+                candidates.append(v)
+        chosen = min(candidates)
+        cur = (chosen, p ^ 1)
+        walk_nodes.append(cur[0])
+    return walk_nodes
+
+
+def _extract_simple_cycle(walk_nodes):
+    """最短奇闭游走（lollipop 形：引道 + 简单奇环 + 原路返回）中抽出简单奇环节点序列。
+
+    walk_nodes 以 s 起、以 s 止且长度为奇数；首个重复出现的节点即环与引道的交点，
+    重复点之间的段落为简单奇环（闭环时不再追加该点）。
+    """
+    first_pos = {}
+    for idx, node in enumerate(walk_nodes):
+        if node in first_pos:
+            return walk_nodes[first_pos[node]:idx]
+        first_pos[node] = idx
+    # 无重复节点：整段就是一个简单奇环（去掉末尾闭合点）
+    return walk_nodes[:-1]
 
 
 def _canonical_ring(nodes):
@@ -169,25 +203,38 @@ def _canonical_ring(nodes):
     return rotated if rotated < reversed_ring else reversed_ring
 
 
-def _shortest_odd_ring(adj, conflict_edges):
-    """在所有着色冲突边中找经过该边的最短奇环。
+def _shortest_odd_ring(adj, members):
+    """在一个连通分量内求最短奇环（odd girth）。
 
-    冲突边 (u,v) 两端同色意味着环长为奇数；去掉该边后求 u→v 最短路，
-    路径 + (v,u) 即一个环，环长 = 路径边数 + 1。取最短者并做唯一化决胜。
+    采用奇偶状态 BFS：把每个节点复制为「偶到达 / 奇到达」两个状态，边连接两种奇偶
+    状态。从 s 以偶状态出发、回到 s 的奇状态的最短路径 = 经过 s 的最短奇闭游走，
+    其环形部分就是一个简单奇环；遍历分量内每个起点 s，取全分量最短者。
+
+    这避免了旧做法「删 BFS 着色冲突边后取端点普通最短路」的漏报：那种方法只看
+    删边后的**单条最短路**，当它与冲突边闭合成偶环（更短的偶环捷径）时该边被跳过；
+    若全部冲突边都如此，真正更长的奇环会被整体漏报。
+
+    决胜：等长奇环中取**规范化节点 ID 序列**（最小 ID 开头、次节点取较小方向）
+    字典序最小者。返回 (长度, 规范化 tuple)；分量为二分图时返回 None。
     """
-    best = None  # (length, canonical tuple, raw ordered nodes)
-    for u, v in conflict_edges:
-        path = _shortest_path(adj, u, v, banned_edge=(u, v))
-        if path is None:
-            continue
-        length = len(path)  # 路径边数 + 闭合边 = len(path) 条边
-        if length % 2 == 0:
-            continue  # 仅取奇环
-        ring = _canonical_ring(path)
-        if best is None or (len(ring), ring) < (len(best[1]), best[1]):
-            best = (len(ring), ring, path)
-    # 返回规整后的环（与 path 同环，仅旋转 / 反向不同，相邻关系一致）
-    return list(best[1]) if best else None
+    member_set = set(members)
+    best = None  # (length, canonical tuple)
+    for s in sorted(member_set):
+        forward = _parity_bfs_dist(adj, s)
+        end_state = (s, 1)
+        if end_state not in forward:
+            continue  # 该起点在二分分量中：无奇环
+        # 反向距离：无向图中 (s,1) 反向到 (u,p) 的最短距离，等于正向从 s 出发
+        # 到达 (u, 1 ^ p) 的距离（沿边走奇偶性翻转）
+        backward = {}
+        for (u, p), d in forward.items():
+            backward[(u, 1 ^ p)] = d
+        walk = _lex_min_parity_walk(adj, (s, 0), end_state, forward, backward)
+        cycle = _extract_simple_cycle(walk)
+        canonical = _canonical_ring(cycle)
+        if best is None or (len(canonical), canonical) < (best[0], best[1]):
+            best = (len(canonical), canonical)
+    return best
 
 
 # ---------------------------------------------------------------- 求解
@@ -260,19 +307,22 @@ def solve(cap_a, cap_b, fertilizers, incompat_pairs):
     comp_index_by_id = {}
     comp_blocks = []
     conflict_comp_idx = None
-    conflict_ring = None
-    for idx, (members, color, conflict_edges) in enumerate(raw_components, start=1):
+    conflict_ring = None  # 规范化 tuple；跨分量等长时按规范化 ID 序列决胜
+    for idx, (members, color, is_conflict) in enumerate(raw_components, start=1):
         for m in members:
             comp_index_by_id[m] = idx
         sides = [[], []]
         for m in members:
             sides[color[m]].append(m)
-        is_conflict = bool(conflict_edges)
         if is_conflict:
-            ring = _shortest_odd_ring(adj, conflict_edges)
-            if ring is not None and (conflict_ring is None or len(ring) < len(conflict_ring)):
-                conflict_ring = ring
-                conflict_comp_idx = idx
+            best_in_comp = _shortest_odd_ring(adj, members)
+            if best_in_comp is not None:
+                length, canonical = best_in_comp
+                if (conflict_ring is None
+                        or (length, canonical)
+                        < (len(conflict_ring), conflict_ring)):
+                    conflict_ring = canonical
+                    conflict_comp_idx = idx
         sums = [sum(amount_by_id[m] for m in sides[0]),
                 sum(amount_by_id[m] for m in sides[1])]
         comp_blocks.append({
