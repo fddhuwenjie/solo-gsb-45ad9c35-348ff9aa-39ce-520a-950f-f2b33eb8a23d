@@ -521,7 +521,7 @@ curl -OJ "http://localhost:8000/api/drip/export?round_id=$RID2"
 ### 求解规则（每次改用量 / 关系 / 容量后整体重算）
 
 1. **只取用量 > 0 的肥料**构建无向不相容图，按边拆分**连通分量**并 BFS **二着色**（每个分量得到侧 0 / 侧 1 两组）。
-2. **奇环冲突（conflict）**：任一连通分量无法二着色（含奇数环）时返回**长度最短的冲突环**（按最小编号起、唯一方向规整），环上各边高亮，**不再给分罐结果**；解除环上任意一条关系后冲突消失。
+2. **奇环冲突（conflict）**：任一连通分量无法二着色（含奇数环）时返回**长度最短的冲突环**（按最小编号起、唯一方向规整），环上各边高亮，**不再给分罐结果**；解除环上任意一条关系后冲突消失。最短奇环用**带奇偶状态的 BFS** 逐分量确定（状态 `(顶点, 路径奇偶)`，从 `(s, 偶)` 到 `(s, 奇)` 的最短路即经 `s` 的最短奇环），不能靠「删冲突边后求普通最短路」——该最短路可能恰是奇数长、与冲突边闭合成偶环捷径，导致把同两点间更长偶路径闭合成的奇环整体漏报，错误返回可分配。
 3. **全局翻转组合枚举**：每个分量有两种翻转方向（侧0→A/侧1→B，或反过来），枚举全部 2^k 种组合（分量超过 20 个时组合数过大，明确报错请用户拆配方）。
 4. **决胜顺序**：① 双罐均不超容量的组合优先（可行优先）；② 可行组合中 **|A 体积 − B 体积| 最小**；③ 体积差相同时按 **A 罐肥料 ID 升序序列**字典序决胜。
 5. **容量无解（overflow）**：所有组合都超容量时**绝不只显示“无法分配”**——返回**总超额最小**的组合（超额相同时继续按体积差、A 罐 ID 序列决胜），给出该方案的 **A/B 分罐明细、各自占用 / 超额量与剩余量**。
@@ -635,6 +635,70 @@ curl -OJ 'http://localhost:8000/api/fertilizer/export?recipe_id=1'
 
 页面侧复核：进入 `/fertilizer`，默认选中「越冬番茄母液配方」，绿色徽标「可分配」且 A/B 两栏各显示 1500/2000 mL、剩余 500 mL；展开「查看全部 4 种翻转组合」可见前两行均可行、体积差 0，按 A 罐 ID 序列选中 `[1, 3]` 行。在左下「两两不相容关系」选「硝酸钙 ✕ 硫酸镁」提交，页面立即变红：顶部「不相容冲突（奇环）」、出现 `#1 硝酸钙 ✕ #2 硝酸钾 ✕ #3 硫酸镁 ✕ #1（闭环）` 冲突链，分罐清单提示存在奇环暂不分罐。删除该条关系后恢复；把左上方 A/B 罐容量都改为 1000 保存，徽标变黄「容量超额（已给出最小超额方案）」，两罐进度条变红、显示「超额 500 mL」，而不是空白或“无法分配”。在肥料明细表把「微量元素」用量改为 0 并失焦，该肥料立即移入「不参与 / 待定」、分量与组合数同步减少。
 
+### 奇环漏报修复复核（偶环捷径 + 更长奇环）
+
+沿用 Docker Compose 启动（`docker compose up --build -d`）。下列配方刻意构造「**偶环捷径**」：每条 BFS 着色冲突边删除后的端点普通最短路都与该边闭合成**偶环**（如 `4-3-5-2` + 边 `2-4` 是 4 环），旧实现会跳过所有冲突边、错误返回可分配；但图中真实存在更长的 **5 环** `1-3-4-2-6-1`，必须检出。复核完可用末尾的 DELETE 清理临时配方。
+
+```bash
+# 1) 新建临时配方并录入 6 种正用量肥料（挂在番茄区，A/B 各 2000 mL）
+#    肥料 id 由数据库分配（内置示例已占用 1-5），用 IDS=() 按录入顺序记下新 id
+RID=$(curl -s -X POST http://localhost:8000/api/fertilizer/recipes \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"奇环漏报复核","zone_id":1,"cap_a":2000,"cap_b":2000,"note":""}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["selected_id"])')
+IDS=()
+for i in $(seq 1 6); do
+  ID=$(curl -s -X POST "http://localhost:8000/api/fertilizer/recipes/$RID/items" \
+    -H 'Content-Type: application/json' -d "{\"name\":\"复核肥$i\",\"amount\":100}" \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin)["selected"]["items"][-1]["id"])')
+  IDS+=("$ID")
+done
+# 2) 登记 7 条不相容关系：边 1-3,1-6,2-4,2-5,2-6,3-4,3-5（下方用录入序号取 id）。
+#    所有 BFS 冲突边删除后都有偶环捷径（如 4-3-5-2 + 边 2-4 为 4 环），
+#    但图中真实存在更长的 5 环 1-3-4-2-6-1。
+for ab in 1,3 1,6 2,4 2,5 2,6 3,4 3,5; do
+  a=${ab%,*}; b=${ab#*,}
+  curl -s -o /dev/null -X POST "http://localhost:8000/api/fertilizer/recipes/$RID/pairs" \
+    -H 'Content-Type: application/json' \
+    -d "{\"a_id\":${IDS[$((a-1))]},\"b_id\":${IDS[$((b-1))]}}"
+done
+# 3) 必须返回 conflict、最短奇环（按录入序号）为 1-3-4-2-6、不给分罐、环上 5 边全部高亮
+curl -s "http://localhost:8000/api/fertilizer/state?recipe_id=$RID" \
+  | IDS_STR="${IDS[*]}" python3 -c '
+import sys, os, json
+ids = list(map(int, os.environ["IDS_STR"].split()))   # 录入序号 -> 真实 id
+r = json.load(sys.stdin)["selected"]["result"]
+ord_of = {fid: i + 1 for i, fid in enumerate(ids)}
+ring = [ord_of[n["id"]] for n in r["conflict_ring"]]
+marked = sorted(tuple(sorted((ord_of[e["a_id"]], ord_of[e["b_id"]])))
+                for e in r["edges"] if e["in_ring"])
+print(r["status"], "最短冲突环(录入序号):", ring, "分量:", r["conflict_component"])
+print("环边标记(录入序号):", marked)
+assert r["status"] == "conflict" and ring == [1, 3, 4, 2, 6]
+assert r["conflict_component"] == 1 and r["decision"] is None
+assert marked == [(1, 3), (1, 6), (2, 4), (2, 6), (3, 4)]
+print("奇环漏报修复复核通过")
+'
+# 4) 删除环上一条关系（录入序号 1✕6）后冲突消失、恢复可分配（图只剩偶环）
+A1=${IDS[0]}; A6=${IDS[5]}
+PID=$(curl -s "http://localhost:8000/api/fertilizer/state?recipe_id=$RID" \
+  | A1=$A1 A6=$A6 python3 -c '
+import sys, os, json
+a, b = int(os.environ["A1"]), int(os.environ["A6"])
+for p in json.load(sys.stdin)["selected"]["pairs"]:
+    if {p["a_id"], p["b_id"]} == {a, b}: print(p["id"])')
+curl -s -X DELETE "http://localhost:8000/api/fertilizer/pairs/$PID" | python3 -c '
+import sys, json
+r = json.load(sys.stdin)["selected"]["result"]
+print("删边后:", r["status"])
+assert r["status"] == "ok"
+'
+# 5) 清理临时配方
+curl -s -o /dev/null -X DELETE "http://localhost:8000/api/fertilizer/recipes/$RID"
+```
+
+不启动容器也可直接跑纯算法回归（无需 Flask）：`python3 test_fertilizer_split.py`，覆盖偶环捷径漏报、三角形、偶环不误报、多分量最短环、同长环规范化决胜，以及可分配 / 容量超额 / 0 用量不进图等既有行为。
+
 ## 内置示例
 
 
@@ -708,7 +772,8 @@ curl -OJ 'http://localhost:8000/api/fertilizer/export?recipe_id=1'
 ├── disease_trace.py    # 病害接触追踪：确诊/到访/消毒按时间重放引擎
 ├── crop_heat.py        # 作物积温：温度截断 / 梯形积分 / 午夜拆分 / 缺口登记 / 7 完整日外推
 ├── drip_uniform.py     # 滴灌巡检：低四分位 DU / 共享供压异常 / 支管压损 / 滴头堵塞判定
-├── fertilizer_split.py # 母液分罐：不相容图连通分量二着色 / 奇环检测 / 全局翻转组合寻优 / 最小超额方案
+├── fertilizer_split.py # 母液分罐：不相容图连通分量二着色 / 带奇偶状态 BFS 奇环检测 / 全局翻转组合寻优 / 最小超额方案
+├── test_fertilizer_split.py # 母液分罐回归（奇环漏报：偶环捷径+更长奇环 / 决胜 / 可分配·超额不变），python3 直接运行
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml

@@ -9,8 +9,11 @@
 求解步骤
 --------
 1. 只用「用量 > 0」的肥料构建不相容图，按边拆分**连通分量**并做 BFS 二着色。
-2. 出现**奇环**时图不可二着色 -> 返回长度最短的冲突环（闭环节点序列），
-   不再给分罐结果。
+2. 出现**奇环**时图不可二着色 -> 返回全图最短的冲突环（闭环节点序列），
+   不再给分罐结果。奇环用**带奇偶状态的 BFS** 在各连通分量中确定：状态
+   (v, p) 表示以奇偶性 p 到达顶点 v，每条边翻转奇偶；从 (s, 0) 到 (s, 1)
+   的最短路即经过 s 的最短奇闭链（必为简单奇环）。多条同长环按规范化
+   肥料 ID 序列字典序稳定决胜。
 3. 每个连通分量着色为两侧（side0 / side1），翻转方向决定哪一侧进 A 罐；
    枚举所有分量的 2^k 种全局翻转组合（分量数 > 20 时组合过多直接报错）。
 4. 目标：先要求双罐均不超容量；可行组合中以 **|A 体积 − B 体积| 最小**为目标，
@@ -135,31 +138,6 @@ def _split_components(adj):
     return components
 
 
-def _shortest_path(adj, src, dst, banned_edge):
-    """无向图 BFS 求 src→dst 最短路径（排除 banned_edge 这条边），返回节点列表或 None。"""
-    q = deque([src])
-    prev = {src: None}
-    while q:
-        u = q.popleft()
-        if u == dst:
-            break
-        for v in sorted(adj[u]):
-            # 精确排除被环借用的那条边（无向、端点顺序无关）
-            if (u, v) == banned_edge or (v, u) == banned_edge:
-                continue
-            if v not in prev:
-                prev[v] = u
-                q.append(v)
-    if dst not in prev:
-        return None
-    path = []
-    cur = dst
-    while cur is not None:
-        path.append(cur)
-        cur = prev[cur]
-    return path[::-1]
-
-
 def _canonical_ring(nodes):
     """把闭环节点序列旋转 / 反向规整为唯一表示（最小 ID 开头，次节点取较小方向）。"""
     n = len(nodes)
@@ -169,24 +147,51 @@ def _canonical_ring(nodes):
     return rotated if rotated < reversed_ring else reversed_ring
 
 
-def _shortest_odd_ring(adj, conflict_edges):
-    """在所有着色冲突边中找经过该边的最短奇环。
+def _shortest_odd_ring(adj):
+    """带奇偶状态的 BFS 求一个连通分量内的最短奇环。
 
-    冲突边 (u,v) 两端同色意味着环长为奇数；去掉该边后求 u→v 最短路，
-    路径 + (v,u) 即一个环，环长 = 路径边数 + 1。取最短者并做唯一化决胜。
+    状态 (v, p) 表示从起点 s 出发、以奇偶性 p（0 偶 / 1 奇）到达顶点 v；
+    每条边在两个奇偶状态间翻转。从 (s, 0) BFS 到 (s, 1) 的最短路，就是
+    经过 s 的最短奇闭链。最短奇闭链必为**简单奇环**：若中途重复经过某
+    顶点，可在重复处把闭链拆成两段，其中一段是更短的奇闭链，与“最短”
+    矛盾。对分量内每个顶点各做一次奇偶 BFS，取全分量最短者；多条同长环
+    按规范化肥料 ID 序列字典序稳定决胜。
+
+    不能用“删边后求端点普通最短路”替代：普通最短路可能恰是奇数长、与该
+    冲突边闭合成偶环（偶环捷径），从而漏掉同两点间更长偶路径闭合出的
+    奇环；若分量内每条冲突边都有这种捷径，旧实现会整体漏报。
     """
     best = None  # (length, canonical tuple, raw ordered nodes)
-    for u, v in conflict_edges:
-        path = _shortest_path(adj, u, v, banned_edge=(u, v))
-        if path is None:
+    for s in sorted(adj):
+        prev = {(s, 0): None}
+        q = deque([(s, 0)])
+        target = None
+        while q:
+            u, p = q.popleft()
+            if u == s and p == 1:
+                target = (u, p)
+                break
+            for v in sorted(adj[u]):
+                state = (v, p ^ 1)
+                if state not in prev:
+                    prev[state] = (u, p)
+                    q.append(state)
+        if target is None:
             continue
-        length = len(path)  # 路径边数 + 闭合边 = len(path) 条边
-        if length % 2 == 0:
-            continue  # 仅取奇环
-        ring = _canonical_ring(path)
-        if best is None or (len(ring), ring) < (len(best[1]), best[1]):
-            best = (len(ring), ring, path)
-    # 返回规整后的环（与 path 同环，仅旋转 / 反向不同，相邻关系一致）
+        states = []
+        cur = target
+        while cur is not None:
+            states.append(cur)
+            cur = prev[cur]
+        states.reverse()                       # (s,0) -> ... -> (s,1)
+        raw = [v for v, _ in states]           # s ... s（首尾同为起点）
+        ring_nodes = raw[:-1]                  # 去掉闭合处重复的 s
+        if len(set(ring_nodes)) != len(ring_nodes):
+            continue  # 最短奇闭链必为简单环；防御性跳过（正常不会触发）
+        canon = _canonical_ring(ring_nodes)
+        cand = (len(canon), canon, ring_nodes)
+        if best is None or (cand[0], cand[1]) < (best[0], best[1]):
+            best = cand
     return list(best[1]) if best else None
 
 
@@ -269,8 +274,12 @@ def solve(cap_a, cap_b, fertilizers, incompat_pairs):
             sides[color[m]].append(m)
         is_conflict = bool(conflict_edges)
         if is_conflict:
-            ring = _shortest_odd_ring(adj, conflict_edges)
-            if ring is not None and (conflict_ring is None or len(ring) < len(conflict_ring)):
+            # 奇环只可能在当前分量内部：在分量子图上做带奇偶状态的 BFS，
+            # 避免跨分量游走；conflict_edges 非空时分量必含奇环。
+            comp_adj = {m: adj[m] for m in members}
+            ring = _shortest_odd_ring(comp_adj)
+            if ring is not None and (conflict_ring is None
+                                     or (len(ring), ring) < (len(conflict_ring), conflict_ring)):
                 conflict_ring = ring
                 conflict_comp_idx = idx
         sums = [sum(amount_by_id[m] for m in sides[0]),
